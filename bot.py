@@ -3,6 +3,8 @@ Phone Deal Alert Bot (Amazon.in + Flipkart) - Telegram
 Run:  pip install -r requirements.txt && cp .env.example .env && python bot.py
 """
 import os, re, sqlite3, logging, asyncio, random
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -15,6 +17,31 @@ SCAN_MINUTES = int(os.getenv("SCAN_MINUTES", "30"))
 DB = "deals.db"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("dealbot")
+
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Minimal endpoint used by Render to verify that the service is running."""
+
+    def do_GET(self):
+        body = b"Bot is running\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        log.info("HTTP %s - %s", self.client_address[0], format % args)
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.daemon_threads = True
+    thread = Thread(target=server.serve_forever, name="health-server", daemon=True)
+    thread.start()
+    log.info("HTTP server started on 0.0.0.0:%s", port)
+    return server, thread
 
 # Scan ke liye search pages - yahan aur URLs/queries add kar sakte ho
 SEARCH_URLS = {
@@ -229,8 +256,14 @@ def main():
                      ("maxprice", maxprice), ("settings", settings), ("scan", scan_now)]:
         app.add_handler(CommandHandler(name, fn))
     app.job_queue.run_repeating(scan_job, interval=SCAN_MINUTES * 60, first=10)
+    health_server, health_thread = start_health_server()
     log.info("Bot started")
-    app.run_polling()
+    try:
+        app.run_polling()
+    finally:
+        health_server.shutdown()
+        health_server.server_close()
+        health_thread.join(timeout=5)
 
 if __name__ == "__main__":
     # Python 3.14 no longer creates a default event loop implicitly.
