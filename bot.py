@@ -233,4 +233,8 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
+    # Python 3.14 no longer creates a default event loop implicitly.
+    # python-telegram-bot's run_polling() expects one to be current.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     main()
