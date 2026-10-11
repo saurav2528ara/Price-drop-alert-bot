@@ -13,7 +13,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SCAN_MINUTES = int(os.getenv("SCAN_MINUTES", "30"))
+SCAN_MINUTES = int(os.getenv("SCAN_MINUTES", "10"))
 DB = "deals.db"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("dealbot")
@@ -77,9 +77,7 @@ def init_db():
         c.executescript("""
         CREATE TABLE IF NOT EXISTS users(
             chat_id INTEGER PRIMARY KEY,
-            min_discount INTEGER DEFAULT 60,   -- MRP se kam se kam itna % off
-            min_drop INTEGER DEFAULT 20,       -- ya pichle price se itna % gira
-            max_price INTEGER DEFAULT 0        -- 0 = koi limit nahi
+            alerts_enabled INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS products(
             url TEXT PRIMARY KEY, site TEXT, title TEXT,
@@ -87,6 +85,10 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS alerted(chat_id INTEGER, url TEXT, price INTEGER, PRIMARY KEY(chat_id, url, price));
         """)
+        # Existing databases predate the one-command alert preference.
+        columns = {row["name"] for row in c.execute("PRAGMA table_info(users)")}
+        if "alerts_enabled" not in columns:
+            c.execute("ALTER TABLE users ADD COLUMN alerts_enabled INTEGER DEFAULT 0")
 
 # ---------------- Fetchers ----------------
 def _num(txt):
@@ -171,7 +173,7 @@ def scan_all():
 
 # ---------------- Core logic ----------------
 def evaluate(items):
-    """Products update karo aur ye list return karo: [(item, discount%, drop%)]"""
+    """Products update karo aur old price ke saath evaluation return karo."""
     results = []
     with db() as c:
         for it in items:
@@ -179,20 +181,27 @@ def evaluate(items):
                 continue
             old = c.execute("SELECT price, lowest FROM products WHERE url=?", (it["url"],)).fetchone()
             disc = round((it["mrp"] - it["price"]) * 100 / it["mrp"]) if it["mrp"] and it["mrp"] > it["price"] else 0
-            drop = round((old["price"] - it["price"]) * 100 / old["price"]) if old and old["price"] > it["price"] else 0
+            old_price = old["price"] if old else None
+            # Keep the decimal value: a ₹1 reduction should still be an alert
+            # when the user chooses "any price drop".
+            drop = ((old_price - it["price"]) * 100 / old_price
+                    if old_price and old_price > it["price"] else 0)
             lowest = min(it["price"], old["lowest"]) if old else it["price"]
             c.execute("""INSERT INTO products(url,site,title,price,mrp,lowest) VALUES(?,?,?,?,?,?)
                          ON CONFLICT(url) DO UPDATE SET price=?, mrp=?, lowest=?, title=?, updated=CURRENT_TIMESTAMP""",
                       (it["url"], it["site"], it["title"], it["price"], it["mrp"], lowest,
                        it["price"], it["mrp"], lowest, it["title"]))
-            results.append((it, disc, drop, lowest))
+            results.append((it, disc, drop, lowest, old_price))
     return results
 
-def fmt(it, disc, drop):
-    tag = "🔥 PRICE DROP" if drop else "💸 BIG DISCOUNT"
+def fmt(it, disc, drop, old_price):
+    price_dropped = old_price is not None and it["price"] < old_price
+    tag = "🔥 PRICE DROP" if price_dropped else "💸 BIG DISCOUNT"
+    drop_text = (f" | ⬇️ ₹{old_price - it['price']:,} sasta ({drop:.2f}%)"
+                 if price_dropped else "")
     return (f"{tag} ({it['site'].title()})\n{it['title']}\n"
             f"💰 ₹{it['price']:,}  (MRP ₹{it['mrp']:,})\n"
-            f"🏷 {disc}% off MRP" + (f" | ⬇️ {drop}% sasta pichle price se" if drop else "") +
+            f"🏷 {disc}% off MRP" + drop_text +
             f"\n🔗 {it['url']}")
 
 async def scan_job(context: ContextTypes.DEFAULT_TYPE):
@@ -203,11 +212,14 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE):
              "matched": 0, "sent": 0, "already_alerted": 0}
     with db() as c:
         users = c.execute("SELECT * FROM users").fetchall()
-        for it, disc, drop, lowest in results:
+        for it, disc, drop, lowest, old_price in results:
             for u in users:
-                if u["max_price"] and it["price"] > u["max_price"]:
+                if not u["alerts_enabled"]:
                     continue
-                if not (disc >= u["min_discount"] or drop >= u["min_drop"]):
+                price_dropped = old_price is not None and it["price"] < old_price
+                # /discount enables all discounts and every actual price drop;
+                # users do not need to choose percentage thresholds.
+                if not (disc > 0 or price_dropped):
                     continue
                 stats["matched"] += 1
                 # ek user ko ek (product, price) combo pe sirf ek baar alert
@@ -216,7 +228,7 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE):
                     stats["already_alerted"] += 1
                     continue
                 try:
-                    await context.bot.send_message(u["chat_id"], fmt(it, disc, drop))
+                    await context.bot.send_message(u["chat_id"], fmt(it, disc, drop, old_price))
                     c.execute("INSERT INTO alerted VALUES(?,?,?)", (u["chat_id"], it["url"], it["price"]))
                     stats["sent"] += 1
                 except Exception as e:
@@ -228,38 +240,22 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE):
 # ---------------- Commands ----------------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     with db() as c:
-        c.execute("INSERT OR IGNORE INTO users(chat_id) VALUES(?)", (update.effective_chat.id,))
+        c.execute("INSERT OR IGNORE INTO users(chat_id, alerts_enabled) VALUES(?, 0)",
+                  (update.effective_chat.id,))
     await update.message.reply_text(
         "👋 Phone Deal Bot ready!\n\n"
-        "/discount 70 - MRP se itna % off pe alert\n"
-        "/drop 25 - pichle price se itna % gira to alert\n"
-        "/maxprice 20000 - is budget ke andar ke phones (0 = off)\n"
-        "/settings - current settings\n"
+        "/discount - discount aur price-drop alerts on karo\n"
         "/scan - abhi scan karo\n\n"
         f"Main har {SCAN_MINUTES} min me Amazon + Flipkart check karta hoon.")
 
-async def _set(update, field, label):
-    try:
-        val = int(update.message.text.split()[1])
-    except Exception:
-        return await update.message.reply_text(f"Aise likho: /{label} 70")
+async def discount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     with db() as c:
-        c.execute("INSERT OR IGNORE INTO users(chat_id) VALUES(?)", (update.effective_chat.id,))
-        c.execute(f"UPDATE users SET {field}=? WHERE chat_id=?", (val, update.effective_chat.id))
-    await update.message.reply_text(f"✅ {label} = {val}")
-
-async def discount(u, c): await _set(u, "min_discount", "discount")
-async def drop(u, c): await _set(u, "min_drop", "drop")
-async def maxprice(u, c): await _set(u, "max_price", "maxprice")
-
-async def settings(update: Update, ctx):
-    with db() as c:
-        u = c.execute("SELECT * FROM users WHERE chat_id=?", (update.effective_chat.id,)).fetchone()
-    if not u:
-        return await update.message.reply_text("Pehle /start karo")
+        c.execute("INSERT OR IGNORE INTO users(chat_id, alerts_enabled) VALUES(?, 1)",
+                  (update.effective_chat.id,))
+        c.execute("UPDATE users SET alerts_enabled=1 WHERE chat_id=?", (update.effective_chat.id,))
     await update.message.reply_text(
-        f"⚙️ Min discount: {u['min_discount']}%\nMin drop: {u['min_drop']}%\n"
-        f"Max price: {'no limit' if not u['max_price'] else '₹' + str(u['max_price'])}")
+        "✅ Alerts on! Ab kisi bhi phone par koi bhi MRP discount ya actual price drop hoga, "
+        "to alert aa jayega. /scan se abhi check kar sakte ho.")
 
 async def scan_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Scan chalu... 1-2 min lagenge")
@@ -275,9 +271,8 @@ async def scan_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif stats["matched"]:
         message += "Matching deal pehle hi isi price par alert ho chuki hai."
     else:
-        message += ("Current settings par koi deal match nahi hui. Yaad rahe: `/drop 25` "
-                    "tabhi alert karta hai jab tracked phone ka price agle scan me 25% gire; "
-                    "pehla scan sirf baseline save karta hai.")
+        message += ("Koi discounted phone ya naya price drop nahi mila. Price-drop ke liye "
+                    "pehla scan baseline save karta hai.")
     if stats["sources_failed"]:
         message += f" ({stats['sources_failed']} source page fail hua.)"
     await update.message.reply_text(message)
@@ -287,8 +282,7 @@ def main():
         raise SystemExit("BOT_TOKEN .env me daalo")
     init_db()
     app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).build()
-    for name, fn in [("start", start), ("discount", discount), ("drop", drop),
-                     ("maxprice", maxprice), ("settings", settings), ("scan", scan_now)]:
+    for name, fn in [("start", start), ("discount", discount), ("scan", scan_now)]:
         app.add_handler(CommandHandler(name, fn))
     app.job_queue.run_repeating(scan_job, interval=SCAN_MINUTES * 60, first=10)
     health_server, health_thread = start_health_server()
