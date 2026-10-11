@@ -1,6 +1,6 @@
 """
 Phone Deal Alert Bot (Amazon.in + Flipkart) - Telegram
-Run:  pip install -r requirements.txt && cp .env.example .env && python bot.py
+Run on Replit: add BOT_TOKEN in Secrets, then use the Run button.
 """
 import os, re, sqlite3, logging, asyncio, random
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,6 +17,8 @@ SCAN_MINUTES = int(os.getenv("SCAN_MINUTES", "10"))
 DB = "deals.db"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("dealbot")
+# Telegram API URLs contain the bot token; do not log HTTP request URLs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Deployment platforms occasionally expose a stale local proxy through the
 # environment.  Deal sites must be reached directly (or through ScraperAPI),
@@ -279,7 +281,7 @@ async def scan_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN .env me daalo")
+        raise SystemExit("Missing BOT_TOKEN: add your Telegram bot token in Replit Secrets, then run again.")
     init_db()
     app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).build()
     for name, fn in [("start", start), ("discount", discount), ("scan", scan_now)]:

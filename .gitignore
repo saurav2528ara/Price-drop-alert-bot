@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 deals.db
+.pythonlibs/
+.env.*
+!.env.example
