@@ -121,7 +121,7 @@ This project is licensed under the **MIT License** — see [LICENSE](LICENSE) fi
 
 ## 📧 Contact
 
-- EMAIL: kumar.saurav.div@gmaail.com
+- EMAIL: kumar.saurav.div@gmail.com
 
 
 ---
