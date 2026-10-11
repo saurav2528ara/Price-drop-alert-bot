@@ -18,6 +18,12 @@ DB = "deals.db"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("dealbot")
 
+# Deployment platforms occasionally expose a stale local proxy through the
+# environment.  Deal sites must be reached directly (or through ScraperAPI),
+# otherwise every scan fails before it can evaluate an alert.
+HTTP = requests.Session()
+HTTP.trust_env = False
+
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     """Minimal endpoint used by Render to verify that the service is running."""
@@ -90,10 +96,11 @@ def _num(txt):
 def fetch_html(url):
     SCRAPER_KEY = os.getenv("SCRAPER_KEY")
     if SCRAPER_KEY:
-        scraper_url = f"http://api.scraperapi.com?api_key={SCRAPER_KEY}&url={url}&country_code=in"
-        r = requests.get(scraper_url, timeout=60)
+        r = HTTP.get("https://api.scraperapi.com", params={
+            "api_key": SCRAPER_KEY, "url": url, "country_code": "in"
+        }, timeout=60)
     else:
-        r = requests.get(url, headers=HEADERS, timeout=20)
+        r = HTTP.get(url, headers=HEADERS, timeout=20)
     if r.status_code != 200 or "captcha" in r.text.lower()[:5000]:
         log.warning("Blocked/failed %s (%s)", url, r.status_code)
         return None
@@ -144,18 +151,23 @@ def parse_flipkart(html):
 PARSERS = {"amazon": parse_amazon, "flipkart": parse_flipkart}
 
 def scan_all():
-    items = []
+    """Return items plus how many source pages succeeded/failed."""
+    items, succeeded, failed = [], 0, 0
     for site, urls in SEARCH_URLS.items():
         for u in urls:
             try:
                 html = fetch_html(u)
                 if html:
                     items += PARSERS[site](html)
+                    succeeded += 1
                     log.info("%s -> %d items so far", site, len(items))
+                else:
+                    failed += 1
             except Exception as e:
+                failed += 1
                 log.error("scan error %s: %s", u, e)
             import time; time.sleep(random.uniform(3, 7))   # polite delay
-    return items
+    return items, succeeded, failed
 
 # ---------------- Core logic ----------------
 def evaluate(items):
@@ -184,8 +196,11 @@ def fmt(it, disc, drop):
             f"\n🔗 {it['url']}")
 
 async def scan_job(context: ContextTypes.DEFAULT_TYPE):
-    items = await asyncio.to_thread(scan_all)
+    items, sources_ok, sources_failed = await asyncio.to_thread(scan_all)
     results = await asyncio.to_thread(evaluate, items)
+    stats = {"sources_ok": sources_ok, "sources_failed": sources_failed,
+             "fetched": len(items), "tracked": len(results),
+             "matched": 0, "sent": 0, "already_alerted": 0}
     with db() as c:
         users = c.execute("SELECT * FROM users").fetchall()
         for it, disc, drop, lowest in results:
@@ -194,15 +209,21 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE):
                     continue
                 if not (disc >= u["min_discount"] or drop >= u["min_drop"]):
                     continue
+                stats["matched"] += 1
                 # ek user ko ek (product, price) combo pe sirf ek baar alert
                 if c.execute("SELECT 1 FROM alerted WHERE chat_id=? AND url=? AND price=?",
                              (u["chat_id"], it["url"], it["price"])).fetchone():
+                    stats["already_alerted"] += 1
                     continue
                 try:
                     await context.bot.send_message(u["chat_id"], fmt(it, disc, drop))
                     c.execute("INSERT INTO alerted VALUES(?,?,?)", (u["chat_id"], it["url"], it["price"]))
+                    stats["sent"] += 1
                 except Exception as e:
                     log.error("send fail %s", e)
+    log.info("scan complete: %s sources OK, %s failed, %s items, %s alerts sent",
+             sources_ok, sources_failed, len(items), stats["sent"])
+    return stats
 
 # ---------------- Commands ----------------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -242,10 +263,24 @@ async def settings(update: Update, ctx):
 
 async def scan_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Scan chalu... 1-2 min lagenge")
-    await scan_job(ctx)
-    with db() as c:
-        n = c.execute("SELECT COUNT(*) n FROM products").fetchone()["n"]
-    await update.message.reply_text(f"✅ Done. Total {n} phones track ho rahe hain.")
+    stats = await scan_job(ctx)
+    if not stats["sources_ok"]:
+        return await update.message.reply_text(
+            "⚠️ Scan fail ho gaya: Amazon/Flipkart se koi data nahi mila, isliye alerts check nahi hui. "
+            "Server logs me `scan error` check karo.")
+    message = (f"✅ Scan complete: {stats['fetched']} listings mili "
+               f"({stats['sources_ok']} source pages). ")
+    if stats["sent"]:
+        message += f"{stats['sent']} naya alert bheja."
+    elif stats["matched"]:
+        message += "Matching deal pehle hi isi price par alert ho chuki hai."
+    else:
+        message += ("Current settings par koi deal match nahi hui. Yaad rahe: `/drop 25` "
+                    "tabhi alert karta hai jab tracked phone ka price agle scan me 25% gire; "
+                    "pehla scan sirf baseline save karta hai.")
+    if stats["sources_failed"]:
+        message += f" ({stats['sources_failed']} source page fail hua.)"
+    await update.message.reply_text(message)
 
 def main():
     if not BOT_TOKEN:
